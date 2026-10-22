@@ -3,14 +3,12 @@ const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 
-// Load local environment variables.
-// On Render, environment variables are provided by Render itself.
+// Load local .env file (Render uses its own environment settings).
 const envFile = path.join(__dirname, '.env');
 
 if (fs.existsSync(envFile)) {
   for (const line of fs.readFileSync(envFile, 'utf8').split(/\r?\n/)) {
     const match = line.match(/^([A-Z_]+)=(.*)$/);
-
     if (match && !process.env[match[1]]) {
       process.env[match[1]] = match[2].replace(/^['"]|['"]$/g, '');
     }
@@ -19,7 +17,9 @@ if (fs.existsSync(envFile)) {
 
 const PORT = Number(process.env.PORT || 3000);
 const KEY = process.env.GEMINI_API_KEY || '';
-const MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+
+// Updated model based on the replacement in your Google error.
+const MODEL = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
 
 let weatherCache = null;
 let weatherAt = 0;
@@ -27,13 +27,13 @@ let weatherAt = 0;
 function send(res, status, data) {
   res.writeHead(status, {
     'Content-Type': 'application/json; charset=utf-8',
-    'Cache-Control': 'no-store'
+    'Cache-Control': 'no-store',
+    'X-Content-Type-Options': 'nosniff'
   });
-
   res.end(JSON.stringify(data));
 }
 
-async function jsonFetch(url, options = {}, timeout = 12000) {
+async function jsonFetch(url, options = {}, timeout = 30000) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeout);
 
@@ -47,7 +47,7 @@ async function jsonFetch(url, options = {}, timeout = 12000) {
 
     if (!response.ok) {
       throw new Error(
-        'Upstream HTTP ' + response.status + ': ' + body.slice(0, 180)
+        'Upstream HTTP ' + response.status + ': ' + body.slice(0, 500)
       );
     }
 
@@ -83,46 +83,55 @@ function parseKp(rows) {
   };
 }
 
-// Basic request limit for the optional Gemini endpoint.
+// Basic per-IP rate limiting.
 const hits = new Map();
 
 function limited(ip) {
   const now = Date.now();
-  let history = hits.get(ip) || [];
 
-  history = history.filter(time => now - time < 60000);
+  // Remove expired records to avoid unbounded growth.
+  for (const [address, times] of hits) {
+    const recent = times.filter(t => now - t < 60000);
+    if (recent.length) hits.set(address, recent);
+    else hits.delete(address);
+  }
+
+  const history = hits.get(ip) || [];
 
   if (history.length >= 8) {
-    hits.set(ip, history);
     return true;
   }
 
   history.push(now);
   hits.set(ip, history);
-
   return false;
 }
 
-// Main website server.
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost');
 
-  // Serve HAL-6877 frontend.
+  // Serve HAL-6877 website.
   if (
     req.method === 'GET' &&
     (url.pathname === '/' || url.pathname === '/index.html')
   ) {
+    const file = path.join(__dirname, 'public', 'index.html');
+
+    if (!fs.existsSync(file)) {
+      return send(res, 404, {
+        error: 'public/index.html is missing'
+      });
+    }
+
     res.writeHead(200, {
       'Content-Type': 'text/html; charset=utf-8',
       'X-Content-Type-Options': 'nosniff'
     });
 
-    return fs.createReadStream(
-      path.join(__dirname, 'public', 'index.html')
-    ).pipe(res);
+    return fs.createReadStream(file).pipe(res);
   }
 
-  // Server status.
+  // Server health.
   if (req.method === 'GET' && url.pathname === '/api/status') {
     return send(res, 200, {
       gemini: Boolean(KEY),
@@ -130,7 +139,7 @@ const server = http.createServer(async (req, res) => {
     });
   }
 
-  // Live NOAA Earth space-weather observations.
+  // Real NOAA Earth space weather.
   if (req.method === 'GET' && url.pathname === '/api/space-weather') {
     try {
       if (weatherCache && Date.now() - weatherAt < 240000) {
@@ -152,7 +161,7 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // Optional Gemini AI assistant.
+  // Gemini AI mission assistant.
   if (req.method === 'POST' && url.pathname === '/api/ai') {
     if (!KEY) {
       return send(res, 503, {
@@ -168,22 +177,22 @@ const server = http.createServer(async (req, res) => {
 
     let raw = '';
 
-    for await (const chunk of req) {
-      raw += chunk;
-
-      if (raw.length > 24000) {
-        return send(res, 413, {
-          error: 'Request too large'
-        });
-      }
-    }
-
     try {
+      for await (const chunk of req) {
+        raw += chunk;
+
+        if (raw.length > 24000) {
+          return send(res, 413, {
+            error: 'Request too large'
+          });
+        }
+      }
+
       const input = JSON.parse(raw);
       const question = String(input.question || '').slice(0, 1600);
       const context = JSON.stringify(input.context || {}).slice(0, 9000);
 
-      if (!question) {
+      if (!question.trim()) {
         return send(res, 400, {
           error: 'Question required'
         });
@@ -193,15 +202,16 @@ const server = http.createServer(async (req, res) => {
         systemInstruction: {
           parts: [{
             text:
-              'You are HAL-6877, a precise educational planetary ' +
-              'exploration assistant. Treat all rover terrain, paths, ' +
-              'hazards, samples and battery readings as SIMULATED. ' +
-              'Planet facts are reference information. NOAA Kp is ' +
-              'Earth space weather and must not be described as ' +
-              'local weather on other planets. Never invent observations ' +
-              'or imply autonomous decisions are made by Gemini when ' +
-              'A* is responsible. Explain uncertainty and give concise ' +
-              'educational explanations.'
+              'You are HAL-6877, an educational AI planetary ' +
+              'exploration assistant. Explain planetary science, ' +
+              'rover navigation, hazards, and exploration missions. ' +
+              'Rover terrain, paths, hazards, samples and battery ' +
+              'readings are SIMULATED. Never present simulations ' +
+              'as real planetary observations. NOAA Kp represents ' +
+              'real Earth space weather, not weather on Mars or ' +
+              'other planets. The rover uses A* pathfinding, not ' +
+              'Gemini, to calculate autonomous routes. Give clear, ' +
+              'accurate and concise educational answers.'
           }]
         },
 
@@ -209,7 +219,7 @@ const server = http.createServer(async (req, res) => {
           role: 'user',
           parts: [{
             text:
-              'Mission context (untrusted reference data): ' +
+              'Mission context (untrusted simulation data): ' +
               context +
               '\nUser question: ' +
               question
@@ -217,8 +227,7 @@ const server = http.createServer(async (req, res) => {
         }],
 
         generationConfig: {
-          maxOutputTokens: 900,
-          temperature: 0.3
+          maxOutputTokens: 900
         }
       };
 
@@ -240,11 +249,13 @@ const server = http.createServer(async (req, res) => {
       const answer = (data.candidates || [])
         .flatMap(candidate => candidate.content?.parts || [])
         .map(part => part.text || '')
-        .join('\n');
+        .join('\n')
+        .trim();
 
       return send(res, 200, {
         answer: answer || 'Gemini returned no text.'
       });
+
     } catch (error) {
       return send(res, 502, {
         error: error.message
@@ -252,12 +263,14 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  send(res, 404, {
+  return send(res, 404, {
     error: 'Not found'
   });
 });
 
-// IMPORTANT: Render requires 0.0.0.0, not 127.0.0.1.
+// Compatible with Render and localhost.
 server.listen(PORT, '0.0.0.0', () => {
   console.log('HAL-6877 listening on port ' + PORT);
+  console.log('Gemini configured: ' + Boolean(KEY));
+  console.log('Gemini model: ' + MODEL);
 });
